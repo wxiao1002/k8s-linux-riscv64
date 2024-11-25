@@ -1,0 +1,2 @@
+FROM k8s-ubuntu:22.04
+COPY flannel-riscv64 /flannel
