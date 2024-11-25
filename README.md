@@ -35,6 +35,11 @@ localhost/k8s-ubuntu                     22.04
 
 已经编译好的放在了release
 
+## docker 镜像
+已经放到release ，直接 docker load -i 就可以使用
+
+# 后续计划
+编译ceph-csi 相关的rv 镜像
 
 
 
