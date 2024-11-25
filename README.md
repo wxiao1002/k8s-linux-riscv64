@@ -35,9 +35,6 @@ localhost/k8s-ubuntu                     22.04
 
 已经编译好的放在了release
 
-## build 
-
-build 目录下放了dockerfile
 
 
 
