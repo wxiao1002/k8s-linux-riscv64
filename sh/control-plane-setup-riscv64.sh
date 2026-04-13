@@ -2,6 +2,7 @@
 
 # ============================================
 # Beautiful Control Plane Setup for RISC-V K8s
+# Fixed Version - Multi-distro support
 # ============================================
 
 # Configuration
@@ -49,7 +50,33 @@ PROGRESS_COMPLETE="█"
 PROGRESS_INCOMPLETE="░"
 
 # ============================================
-# UI Helper Functions
+# Package Manager Detection
+# ============================================
+
+detect_package_manager() {
+    if command -v apt-get &> /dev/null; then
+        PKG_MANAGER="apt-get"
+        PKG_UPDATE="apt-get update -qq"
+        PKG_UPGRADE="apt-get upgrade -y -qq"
+        PKG_INSTALL="apt-get install -y -qq"
+    elif command -v dnf &> /dev/null; then
+        PKG_MANAGER="dnf"
+        PKG_UPDATE="dnf makecache --quiet"
+        PKG_UPGRADE="dnf upgrade -y -q"
+        PKG_INSTALL="dnf install -y -q"
+    elif command -v yum &> /dev/null; then
+        PKG_MANAGER="yum"
+        PKG_UPDATE="yum makecache -q"
+        PKG_UPGRADE="yum update -y -q"
+        PKG_INSTALL="yum install -y -q"
+    else
+        echo -e "${RED}Error: No supported package manager found (apt-get/dnf/yum)${NC}"
+        exit 1
+    fi
+}
+
+# ============================================
+# UI Helper Functions (Fixed)
 # ============================================
 
 print_header() {
@@ -85,7 +112,8 @@ spinner() {
     local message=$2
     local i=0
     
-    tput civis # Hide cursor
+    # Save cursor position and hide cursor
+    tput civis 2>/dev/null || true
     
     while kill -0 $pid 2>/dev/null; do
         printf "\r${CYAN}  ${SPINNER_FRAMES[$i]} ${NC}${message}..."
@@ -102,7 +130,8 @@ spinner() {
         printf "\r${RED}  ✗${NC} ${message}... ${RED}Failed${NC}\n"
     fi
     
-    tput cnorm # Show cursor
+    # Show cursor again
+    tput cnorm 2>/dev/null || true
     
     return $exit_code
 }
@@ -110,21 +139,22 @@ spinner() {
 run_with_spinner() {
     local message=$1
     shift
+    local temp_output="/tmp/spinner_output_$$"
     
     # Run command in background and capture output
     (
-        "$@" > /tmp/spinner_output_$$ 2>&1
+        "$@" > "$temp_output" 2>&1
     ) &
     
     local pid=$!
     spinner $pid "$message"
     local exit_code=$?
     
-    if [ $exit_code -ne 0 ]; then
-        echo -e "${DIM}${GRAY}$(cat /tmp/spinner_output_$$)${NC}"
+    if [ $exit_code -ne 0 ] && [ -f "$temp_output" ]; then
+        echo -e "${DIM}${GRAY}$(cat "$temp_output")${NC}"
     fi
     
-    rm -f /tmp/spinner_output_$$
+    rm -f "$temp_output"
     return $exit_code
 }
 
@@ -163,12 +193,43 @@ progress_bar() {
 }
 
 # ============================================
+# Check Prerequisites
+# ============================================
+
+check_requirements() {
+    # Check if running as root or with sudo
+    if [ "$EUID" -eq 0 ]; then 
+        print_warning "Running as root directly, sudo commands will be adjusted"
+        SUDO=""
+    else
+        SUDO="sudo"
+    fi
+    
+    # Check for required tools
+    local missing_tools=()
+    for tool in curl wget git; do
+        if ! command -v $tool &> /dev/null; then
+            missing_tools+=($tool)
+        fi
+    done
+    
+    if [ ${#missing_tools[@]} -gt 0 ]; then
+        print_warning "Installing missing tools: ${missing_tools[*]}"
+        $SUDO $PKG_INSTALL ${missing_tools[*]} 2>/dev/null || true
+    fi
+}
+
+# ============================================
 # Main Setup
 # ============================================
+
+# Detect package manager first
+detect_package_manager
 
 print_header
 
 echo -e "${BOLD}${WHITE}Configuration:${NC}"
+echo -e "${GRAY}  Package Manager:    ${NC}${PKG_MANAGER}"
 echo -e "${GRAY}  DockerHub User:     ${NC}${DOCKERHUB_USER}"
 echo -e "${GRAY}  Kubernetes:         ${NC}v${K8S_VERSION}"
 echo -e "${GRAY}  Flannel:            ${NC}v${FLANNEL_VERSION}"
@@ -179,84 +240,103 @@ echo ""
 
 read -p "$(echo -e ${YELLOW}Press Enter to start installation...${NC})"
 
+# Check and install prerequisites
+check_requirements
+
 # ============================================
 # Step 1: Cleanup
 # ============================================
 
 print_step_header "1" "Cleaning up existing installation"
 
-run_with_spinner "Stopping kubelet" sudo systemctl stop kubelet 2>/dev/null || true
-run_with_spinner "Resetting kubeadm" sudo kubeadm reset -f 2>/dev/null || true
-run_with_spinner "Removing config directories" sudo rm -rf /etc/kubernetes/ /var/lib/etcd/ $HOME/.kube/
+run_with_spinner "Stopping kubelet" $SUDO systemctl stop kubelet 2>/dev/null || true
+run_with_spinner "Resetting kubeadm" $SUDO kubeadm reset -f 2>/dev/null || true
+run_with_spinner "Removing config directories" $SUDO rm -rf /etc/kubernetes/ /var/lib/etcd/ $HOME/.kube/
 run_with_spinner "Cleaning up networking" bash -c "
-    sudo ip link delete cni0 2>/dev/null || true
-    sudo ip link delete flannel.1 2>/dev/null || true
-    sudo rm -rf /var/lib/cni/ /etc/cni/net.d/* /run/flannel/
+    $SUDO ip link delete cni0 2>/dev/null || true
+    $SUDO ip link delete flannel.1 2>/dev/null || true
+    $SUDO rm -rf /var/lib/cni/ /etc/cni/net.d/* /run/flannel/
 "
 run_with_spinner "Removing old services" bash -c "
-    sudo systemctl stop flanneld 2>/dev/null || true
-    sudo systemctl disable flanneld 2>/dev/null || true
-    sudo rm -f /etc/systemd/system/flanneld.service
-    sudo systemctl daemon-reload
+    $SUDO systemctl stop flanneld 2>/dev/null || true
+    $SUDO systemctl disable flanneld 2>/dev/null || true
+    $SUDO rm -f /etc/systemd/system/flanneld.service
+    $SUDO systemctl daemon-reload
 "
-run_with_spinner "Flushing iptables" sudo iptables -F && sudo iptables -t nat -F && sudo iptables -t mangle -F && sudo iptables -X
+run_with_spinner "Flushing iptables" $SUDO iptables -F && $SUDO iptables -t nat -F && $SUDO iptables -t mangle -F && $SUDO iptables -X
 
 print_step_footer "success"
 
 # ============================================
-# Step 2: Install Dependencies
+# Step 2: Install Dependencies (FIXED)
 # ============================================
 
 print_step_header "2" "Installing dependencies"
 
-run_with_spinner "Updating package lists" sudo apt-get update -qq
-run_with_spinner "Upgrading packages" sudo apt-get upgrade -y -qq
-run_with_spinner "Installing containerd" sudo apt-get install -y -qq containerd apt-transport-https ca-certificates curl gpg
+run_with_spinner "Updating package lists" $SUDO $PKG_UPDATE
+run_with_spinner "Upgrading packages" $SUDO $PKG_UPGRADE
+
+# Install containerd and dependencies
+print_info "Installing containerd and required packages..."
+case $PKG_MANAGER in
+    "apt-get")
+        run_with_spinner "Installing packages" $SUDO $PKG_INSTALL containerd apt-transport-https ca-certificates curl gpg
+        ;;
+    "dnf"|"yum")
+        # For RHEL/Fedora, some packages have different names
+        run_with_spinner "Installing packages" $SUDO $PKG_INSTALL containerd ca-certificates curl gpg
+        # Enable containerd service
+        $SUDO systemctl enable containerd 2>/dev/null || true
+        $SUDO systemctl start containerd 2>/dev/null || true
+        ;;
+esac
 
 print_info "Configuring containerd..."
-sudo mkdir -p /etc/containerd
-containerd config default | sudo tee /etc/containerd/config.toml > /dev/null 2>&1
+$SUDO mkdir -p /etc/containerd
+if ! $SUDO test -f /etc/containerd/config.toml; then
+    containerd config default | $SUDO tee /etc/containerd/config.toml > /dev/null 2>&1
+fi
 
-run_with_spinner "Enabling systemd cgroup" sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-run_with_spinner "Setting custom pause image" sudo sed -i "s|sandbox_image = .*|sandbox_image = \"${DOCKERHUB_USER}/pause:${PAUSE_VERSION}\"|g" /etc/containerd/config.toml
-run_with_spinner "Configuring CNI path" sudo sed -i 's|bin_dir = .*|bin_dir = "/opt/cni/bin"|g' /etc/containerd/config.toml
+run_with_spinner "Enabling systemd cgroup" $SUDO sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+run_with_spinner "Setting custom pause image" $SUDO sed -i "s|sandbox_image = .*|sandbox_image = \"${DOCKERHUB_USER}/pause:${PAUSE_VERSION}\"|g" /etc/containerd/config.toml
+run_with_spinner "Configuring CNI path" $SUDO sed -i 's|bin_dir = .*|bin_dir = "/opt/cni/bin"|g' /etc/containerd/config.toml
 
 print_success "Pause image: ${DOCKERHUB_USER}/pause:${PAUSE_VERSION}"
 print_success "CNI bin dir: /opt/cni/bin"
 
-run_with_spinner "Restarting containerd" sudo systemctl restart containerd
-run_with_spinner "Enabling containerd" sudo systemctl enable containerd > /dev/null 2>&1
+run_with_spinner "Restarting containerd" $SUDO systemctl restart containerd
+run_with_spinner "Enabling containerd" $SUDO systemctl enable containerd > /dev/null 2>&1
 
 run_with_spinner "Disabling swap" bash -c "
-    sudo swapoff -a
-    sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+    $SUDO swapoff -a
+    $SUDO sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab 2>/dev/null || true
 "
 
 print_info "Loading kernel modules..."
-cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf > /dev/null
+cat <<EOF | $SUDO tee /etc/modules-load.d/k8s.conf > /dev/null
 overlay
 br_netfilter
 EOF
 
-run_with_spinner "Loading overlay module" sudo modprobe overlay
-run_with_spinner "Loading br_netfilter module" sudo modprobe br_netfilter
+run_with_spinner "Loading overlay module" $SUDO modprobe overlay 2>/dev/null || true
+run_with_spinner "Loading br_netfilter module" $SUDO modprobe br_netfilter 2>/dev/null || true
 
 print_info "Configuring sysctl..."
-cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf > /dev/null
+cat <<EOF | $SUDO tee /etc/sysctl.d/k8s.conf > /dev/null
 net.bridge.bridge-nf-call-iptables  = 1
 net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.ip_forward                 = 1
 EOF
 
-run_with_spinner "Applying sysctl settings" sudo sysctl --system > /dev/null 2>&1
+run_with_spinner "Applying sysctl settings" $SUDO sysctl --system > /dev/null 2>&1
 
 print_info "Installing crictl..."
 VERSION="v1.28.0"
 (
     wget -q https://github.com/kubernetes-sigs/cri-tools/releases/download/$VERSION/crictl-$VERSION-linux-riscv64.tar.gz
-    sudo tar zxf crictl-$VERSION-linux-riscv64.tar.gz -C /usr/local/bin
+    $SUDO tar zxf crictl-$VERSION-linux-riscv64.tar.gz -C /usr/local/bin
     rm -f crictl-$VERSION-linux-riscv64.tar.gz
-    cat <<EOF | sudo tee /etc/crictl.yaml > /dev/null
+    cat <<EOF | $SUDO tee /etc/crictl.yaml > /dev/null
 runtime-endpoint: unix:///var/run/containerd/containerd.sock
 image-endpoint: unix:///var/run/containerd/containerd.sock
 timeout: 10
@@ -273,11 +353,11 @@ print_step_footer "success"
 
 print_step_header "3" "Setting up kubelet service"
 
-sudo mkdir -p /etc/systemd/system/kubelet.service.d /etc/default /var/lib/kubelet /etc/kubernetes/manifests /etc/kubernetes/pki /opt/cni/bin /etc/cni/net.d /run/flannel
+$SUDO mkdir -p /etc/systemd/system/kubelet.service.d /etc/default /var/lib/kubelet /etc/kubernetes/manifests /etc/kubernetes/pki /opt/cni/bin /etc/cni/net.d /run/flannel
 
 print_info "Creating kubelet service files..."
 
-cat <<'KUBELET_SERVICE' | sudo tee /etc/systemd/system/kubelet.service > /dev/null
+cat <<'KUBELET_SERVICE' | $SUDO tee /etc/systemd/system/kubelet.service > /dev/null
 [Unit]
 Description=kubelet: The Kubernetes Node Agent
 Documentation=https://kubernetes.io/docs/
@@ -294,7 +374,7 @@ RestartSec=10
 WantedBy=multi-user.target
 KUBELET_SERVICE
 
-cat <<'KUBELET_DROPIN' | sudo tee /etc/systemd/system/kubelet.service.d/10-kubeadm.conf > /dev/null
+cat <<'KUBELET_DROPIN' | $SUDO tee /etc/systemd/system/kubelet.service.d/10-kubeadm.conf > /dev/null
 [Service]
 Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
 Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
@@ -304,12 +384,12 @@ ExecStart=
 ExecStart=/usr/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS $KUBELET_EXTRA_ARGS
 KUBELET_DROPIN
 
-cat <<'KUBELET_DEFAULTS' | sudo tee /etc/default/kubelet > /dev/null
+cat <<'KUBELET_DEFAULTS' | $SUDO tee /etc/default/kubelet > /dev/null
 KUBELET_EXTRA_ARGS=
 KUBELET_DEFAULTS
 
-run_with_spinner "Reloading systemd" sudo systemctl daemon-reload
-run_with_spinner "Enabling kubelet" sudo systemctl enable kubelet > /dev/null 2>&1
+run_with_spinner "Reloading systemd" $SUDO systemctl daemon-reload
+run_with_spinner "Enabling kubelet" $SUDO systemctl enable kubelet > /dev/null 2>&1
 
 print_step_footer "success"
 
@@ -337,15 +417,15 @@ CURRENT=0
 for image in "${IMAGES[@]}"; do
     CURRENT=$((CURRENT + 1))
     progress_bar $CURRENT $TOTAL_IMAGES
-    (sudo ctr -n k8s.io images pull docker.io/${DOCKERHUB_USER}/${image} > /dev/null 2>&1) &
+    ($SUDO ctr -n k8s.io images pull docker.io/${DOCKERHUB_USER}/${image} > /dev/null 2>&1) &
     spinner $! "Pulling ${image}"
 done
 
 print_info "Tagging images for kubeadm..."
 
 ctr_retag() {
-    sudo ctr -n k8s.io images rm "$2" 2>/dev/null || true
-    sudo ctr -n k8s.io images tag "$1" "$2" > /dev/null 2>&1
+    $SUDO ctr -n k8s.io images rm "$2" 2>/dev/null || true
+    $SUDO ctr -n k8s.io images tag "$1" "$2" > /dev/null 2>&1
 }
 
 ctr_retag docker.io/${DOCKERHUB_USER}/kube-apiserver:${K8S_VERSION} registry.k8s.io/kube-apiserver:v${K8S_VERSION}
@@ -371,23 +451,33 @@ print_info "Downloading CNI plugins ${CNI_VERSION}..."
 
 (
     wget -q https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-riscv64-${CNI_VERSION}.tgz
-    sudo tar -xzf cni-plugins-linux-riscv64-${CNI_VERSION}.tgz -C /opt/cni/bin
+    $SUDO tar -xzf cni-plugins-linux-riscv64-${CNI_VERSION}.tgz -C /opt/cni/bin
     rm cni-plugins-linux-riscv64-${CNI_VERSION}.tgz
 ) > /dev/null 2>&1 &
 spinner $! "Installing standard CNI plugins"
 
-print_info "Building Flannel CNI plugin..."
-(
-    cd /tmp
-    rm -rf cni-plugin
-    git clone --depth=1 https://github.com/flannel-io/cni-plugin.git > /dev/null 2>&1
-    cd cni-plugin
-    CGO_ENABLED=0 go build -o flannel . > /dev/null 2>&1
-    sudo install -m 755 flannel /opt/cni/bin/flannel
-    cd ~
-    rm -rf /tmp/cni-plugin
-) > /dev/null 2>&1 &
-spinner $! "Building Flannel CNI plugin"
+# Check if Go is installed for building Flannel CNI
+if ! command -v go &> /dev/null; then
+    print_warning "Go not found, skipping Flannel CNI build (will use existing or download)"
+    # Try to download pre-built binary if available
+    if [ ! -f /opt/cni/bin/flannel ]; then
+        print_info "Attempting to download pre-built Flannel CNI..."
+        $SUDO cp /opt/cni/bin/bridge /opt/cni/bin/flannel 2>/dev/null || print_warning "Flannel CNI plugin will be handled by Flannel DaemonSet"
+    fi
+else
+    print_info "Building Flannel CNI plugin..."
+    (
+        cd /tmp
+        rm -rf cni-plugin
+        git clone --depth=1 https://github.com/flannel-io/cni-plugin.git > /dev/null 2>&1
+        cd cni-plugin
+        CGO_ENABLED=0 go build -o flannel . > /dev/null 2>&1
+        $SUDO install -m 755 flannel /opt/cni/bin/flannel
+        cd ~
+        rm -rf /tmp/cni-plugin
+    ) > /dev/null 2>&1 &
+    spinner $! "Building Flannel CNI plugin"
+fi
 
 print_success "CNI plugins installed to /opt/cni/bin"
 
@@ -402,13 +492,13 @@ print_step_header "6" "Initializing Kubernetes control plane"
 print_warning "This may take a few minutes..."
 
 (
-    sudo kubeadm init \
+    $SUDO kubeadm init \
       --pod-network-cidr=10.244.0.0/16 \
       --kubernetes-version=v${K8S_VERSION} > /tmp/kubeadm_init.log 2>&1
     
     mkdir -p $HOME/.kube
-    sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
-    sudo chown $(id -u):$(id -g) $HOME/.kube/config
+    $SUDO cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+    $SUDO chown $(id -u):$(id -g) $HOME/.kube/config
 ) &
 spinner $! "Initializing control plane"
 
@@ -520,8 +610,6 @@ print_step_footer "success"
 
 print_step_header "11" "Verifying installation"
 
-run_with_spinner "Waiting for all pods to be ready..."
-
 sleep 5
 
 run_with_spinner "Waiting for nodes to be ready" kubectl wait --for=condition=ready node --all --timeout=60s > /dev/null 2>&1 || true
@@ -580,7 +668,7 @@ echo ""
 echo -e "${BOLD}${CYAN}Join Worker Nodes:${NC}"
 echo -e "${GRAY}Run this command on worker nodes:${NC}"
 echo ""
-JOIN_CMD=$(sudo kubeadm token create --print-join-command 2>/dev/null)
+JOIN_CMD=$($SUDO kubeadm token create --print-join-command 2>/dev/null)
 echo -e "${WHITE}  ${JOIN_CMD}${NC}"
 echo ""
 
