@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================
-# Worker Node Setup (x86 or RISC-V) - Fixed Version
+# Worker Node Setup (x86 or RISC-V) - Fedora/RISC-V Optimized
 # Multi-distro support with package manager detection
 # ============================================
 
@@ -25,6 +25,7 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 WHITE='\033[1;37m'
 GRAY='\033[0;90m'
+DIM='\033[2m'
 NC='\033[0m'
 BOLD='\033[1m'
 
@@ -97,7 +98,7 @@ if [ -z "$JOIN_COMMAND" ]; then
     echo -e "${YELLOW}Usage: ./setup-worker.sh <join-command>${NC}"
     echo ""
     echo -e "${CYAN}Example:${NC}"
-    echo "  ./setup-worker.sh kubeadm join 192.168.20.59:6443 --token abc123... --discovery-token-ca-cert-hash sha256:xyz..."
+    echo "  ./setup-worker.sh kubeadm join 172.26.164.69:6443 --token abc123... --discovery-token-ca-cert-hash sha256:xyz..."
     echo ""
     echo -e "${CYAN}Get the join command from your control plane:${NC}"
     echo "  sudo kubeadm token create --print-join-command"
@@ -109,6 +110,11 @@ if [ "$EUID" -eq 0 ]; then
     print_warning "Running as root directly, sudo commands will be adjusted"
     SUDO=""
 else
+    # Check if user has sudo privileges
+    if ! sudo -v &> /dev/null; then
+        print_error "User does not have sudo privileges"
+        exit 1
+    fi
     SUDO="sudo"
 fi
 
@@ -148,7 +154,7 @@ $SUDO rm -rf /etc/kubernetes/ /var/lib/kubelet/ /var/lib/etcd/ $HOME/.kube/
 print_info "Cleaning up networking..."
 $SUDO ip link delete cni0 2>/dev/null || true
 $SUDO ip link delete flannel.1 2>/dev/null || true
-$SUDO rm -rf /var/lib/cni/ /etc/cni/net.d/*
+$SUDO rm -rf /var/lib/cni/ /etc/cni/net.d/* 2>/dev/null || true
 
 print_info "Removing old services..."
 $SUDO systemctl disable flanneld 2>/dev/null || true
@@ -166,7 +172,7 @@ $SUDO rm -f /usr/local/bin/flanneld 2>/dev/null || true
 print_success "Cleanup complete"
 
 # ============================================
-# Step 2: Install Dependencies (FIXED)
+# Step 2: Install Dependencies (FEDORA/RISC-V OPTIMIZED)
 # ============================================
 
 print_section "Step 2: Installing dependencies"
@@ -174,28 +180,29 @@ print_section "Step 2: Installing dependencies"
 print_info "Updating package lists..."
 $SUDO $PKG_UPDATE
 
-print_info "Upgrading packages..."
-$SUDO $PKG_UPGRADE
-
 print_info "Installing required packages..."
 case $PKG_MANAGER in
     "apt-get")
         $SUDO $PKG_INSTALL containerd conntrack ethtool socat ebtables apt-transport-https ca-certificates curl gpg wget
         ;;
     "dnf"|"yum")
-        # RHEL/Fedora package names may differ
-        $SUDO $PKG_INSTALL containerd conntrack-tools ethtool socat iptables-ebtables ca-certificates curl gpg wget
-        # Enable and start containerd
-        $SUDO systemctl enable containerd 2>/dev/null || true
-        $SUDO systemctl start containerd 2>/dev/null || true
+        # Fedora/RHEL package names
+        print_info "Installing Fedora/RHEL packages..."
+        $SUDO $PKG_INSTALL containerd conntrack-tools ethtool socat iptables-ebtables ca-certificates curl gnupg wget
+        
+        # Create containerd config directory
+        $SUDO mkdir -p /etc/containerd
+        
+        # Generate default config if not exists
+        if [ ! -f /etc/containerd/config.toml ]; then
+            print_info "Generating default containerd config..."
+            containerd config default | $SUDO tee /etc/containerd/config.toml > /dev/null
+        fi
         ;;
 esac
 
 print_info "Configuring containerd..."
 $SUDO mkdir -p /etc/containerd
-if ! $SUDO test -f /etc/containerd/config.toml; then
-    containerd config default | $SUDO tee /etc/containerd/config.toml > /dev/null
-fi
 
 print_info "Enabling systemd cgroup driver..."
 $SUDO sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
@@ -204,7 +211,13 @@ $SUDO sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/con
 print_info "Configuring custom pause image..."
 
 # Detect containerd version
-CONTAINERD_VERSION=$(containerd --version 2>/dev/null | awk '{print $3}' || echo "1.0.0")
+if command -v containerd &> /dev/null; then
+    CONTAINERD_VERSION=$(containerd --version 2>/dev/null | awk '{print $3}' || echo "1.0.0")
+else
+    CONTAINERD_VERSION="1.0.0"
+    print_warning "containerd not found in PATH, assuming version ${CONTAINERD_VERSION}"
+fi
+
 CONTAINERD_MAJOR=$(echo "$CONTAINERD_VERSION" | cut -d. -f1)
 CONTAINERD_MINOR=$(echo "$CONTAINERD_VERSION" | cut -d. -f2)
 
@@ -233,7 +246,6 @@ EOF
         print_error "Failed to configure pinned_images.sandbox"
         echo -e "${GRAY}Current configuration:${NC}"
         $SUDO grep -A2 "pinned_images" /etc/containerd/config.toml 2>/dev/null || echo "  pinned_images section not found"
-        exit 1
     fi
     
 elif [ "$CONTAINERD_MAJOR" -eq 1 ]; then
@@ -250,17 +262,25 @@ elif [ "$CONTAINERD_MAJOR" -eq 1 ]; then
         print_success "sandbox_image configured"
     else
         print_error "Failed to configure sandbox_image"
-        exit 1
     fi
     
 else
     print_error "Unable to determine containerd version"
-    exit 1
 fi
 
-print_info "Restarting containerd..."
+print_info "Starting and enabling containerd..."
+$SUDO systemctl daemon-reload
+$SUDO systemctl enable containerd > /dev/null 2>&1 || true
 $SUDO systemctl restart containerd
-$SUDO systemctl enable containerd > /dev/null 2>&1
+sleep 2
+
+# Verify containerd is running
+if systemctl is-active --quiet containerd; then
+    print_success "containerd is running"
+else
+    print_error "containerd failed to start"
+    $SUDO systemctl status containerd --no-pager
+fi
 
 print_info "Disabling swap..."
 $SUDO swapoff -a
@@ -335,9 +355,18 @@ elif [ "$ARCH" = "riscv64" ]; then
         if ! wget -q --show-progress "${K8S_TARBALL_URL}" -O kubernetes.tar.gz; then
             print_error "Failed to download Kubernetes tarball"
             echo -e "${GRAY}URL: ${K8S_TARBALL_URL}${NC}"
-            exit 1
+            echo -e "${YELLOW}Trying alternative download method...${NC}"
+            
+            # Try with curl if wget fails
+            if curl -L "${K8S_TARBALL_URL}" -o kubernetes.tar.gz; then
+                print_success "Downloaded with curl"
+            else
+                print_error "Both wget and curl failed"
+                exit 1
+            fi
         fi
         
+        print_info "Extracting tarball..."
         tar -xzf kubernetes.tar.gz
         
         # Run the install script
@@ -425,6 +454,10 @@ print_section "Step 5: Joining the cluster"
 echo -e "${CYAN}Running: $SUDO $JOIN_COMMAND${NC}"
 echo ""
 
+# Create necessary directories
+$SUDO mkdir -p /etc/kubernetes/manifests
+$SUDO mkdir -p /var/lib/kubelet
+
 if $SUDO $JOIN_COMMAND; then
     print_success "Node joined successfully"
 else
@@ -434,6 +467,7 @@ else
     echo "  1. Ensure the control plane is reachable"
     echo "  2. Check if the token is still valid"
     echo "  3. Verify network connectivity to port 6443"
+    echo "  4. Check containerd status: sudo systemctl status containerd"
     exit 1
 fi
 
@@ -447,7 +481,13 @@ sleep 5
 
 echo ""
 echo -e "${BOLD}${WHITE}Kubelet Status:${NC}"
-$SUDO systemctl is-active kubelet && print_success "Kubelet is running" || print_warning "Kubelet not running yet"
+if systemctl is-active --quiet kubelet; then
+    print_success "Kubelet is running"
+else
+    print_warning "Kubelet not running yet"
+    echo -e "${GRAY}Checking kubelet logs...${NC}"
+    $SUDO journalctl -u kubelet --no-pager -n 10
+fi
 
 echo ""
 echo -e "${BOLD}${WHITE}Pause Image Configuration:${NC}"
