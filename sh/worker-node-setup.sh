@@ -184,16 +184,67 @@ sudo systemctl restart containerd
 echo "✓ Containerd configured with default pause image (registry.k8s.io/pause:${PAUSE_VERSION})"
 echo ""
 
-# Disable swap
+# --- DISABLE SWAP (Fedora-specific) ---
+echo "Step 3: Disabling swap (Fedora-specific)..."
+
+# Disable regular swap
+echo "Disabling regular swap..."
 sudo swapoff -a
-# Fedora uses different swap configuration
+
+# Comment out swap entries in fstab
+echo "Commenting out swap entries in /etc/fstab..."
 sudo sed -i '/ swap / s/^/#/' /etc/fstab
-# Also disable zram if present (common in Fedora)
-sudo systemctl stop systemd-zram-setup@zram0.service 2>/dev/null || true
-sudo systemctl disable systemd-zram-setup@zram0.service 2>/dev/null || true
-sudo swapoff /dev/zram0 2>/dev/null || true
+
+# Fedora often uses zram by default - disable it
+echo "Checking for zram swap..."
+
+# Stop and disable zram service if active
+if systemctl is-active --quiet systemd-zram-setup@zram0.service 2>/dev/null; then
+    echo "Stopping systemd-zram-setup@zram0.service..."
+    sudo systemctl stop systemd-zram-setup@zram0.service
+    echo "Disabling systemd-zram-setup@zram0.service..."
+    sudo systemctl disable systemd-zram-setup@zram0.service
+else
+    echo "zram service is not active or not found"
+fi
+
+# Disable specific zram devices
+if [ -e /dev/zram0 ]; then
+    echo "Disabling zram0 device..."
+    sudo swapoff /dev/zram0 2>/dev/null || true
+    echo "Resetting zram0 device..."
+    sudo zramctl --reset /dev/zram0 2>/dev/null || true
+    echo "✓ zram0 disabled and reset"
+else
+    echo "No zram0 device found"
+fi
+
+# Check for other zram devices
+for zram_dev in /dev/zram*; do
+    if [ -e "$zram_dev" ]; then
+        echo "Found additional zram device: $zram_dev"
+        sudo swapoff "$zram_dev" 2>/dev/null || true
+        sudo zramctl --reset "$zram_dev" 2>/dev/null || true
+        echo "✓ $zram_dev disabled and reset"
+    fi
+done
+
+# Verify swap is completely disabled
+echo ""
+echo "Verifying swap status..."
+if [ "$(sudo swapon --noheadings | wc -l)" -eq 0 ]; then
+    echo "✓ All swap is disabled"
+else
+    echo "⚠ Warning: Some swap might still be active:"
+    sudo swapon --show
+fi
+
+echo ""
+echo "✓ Swap configuration complete"
+echo ""
 
 # Load kernel modules
+echo "Step 4: Loading kernel modules..."
 cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
 overlay
 br_netfilter
@@ -202,7 +253,11 @@ EOF
 sudo modprobe overlay
 sudo modprobe br_netfilter
 
+echo "✓ Kernel modules loaded"
+echo ""
+
 # Configure sysctl
+echo "Step 5: Configuring sysctl parameters..."
 cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
 net.bridge.bridge-nf-call-iptables  = 1
 net.bridge.bridge-nf-call-ip6tables = 1
@@ -211,7 +266,11 @@ EOF
 
 sudo sysctl --system
 
+echo "✓ Sysctl configured"
+echo ""
+
 # Configure firewall if firewalld is active
+echo "Step 6: Configuring firewall..."
 if systemctl is-active --quiet firewalld; then
     echo "Configuring firewalld for Kubernetes..."
     sudo firewall-cmd --permanent --add-port=10250/tcp  # Kubelet API
@@ -219,13 +278,17 @@ if systemctl is-active --quiet firewalld; then
     sudo firewall-cmd --permanent --add-port=8472/udp  # Flannel VXLAN (if using Flannel)
     sudo firewall-cmd --permanent --add-port=8285/udp  # Flannel UDP (if using Flannel)
     sudo firewall-cmd --reload
+    echo "✓ Firewalld configured"
+else
+    echo "Firewalld is not active, skipping firewall configuration"
 fi
 
+echo ""
 echo "✓ System configured"
 echo ""
 
 # --- INSTALL KUBERNETES ---
-echo "Step 3: Installing Kubernetes..."
+echo "Step 7: Installing Kubernetes..."
 
 if [ "$ARCH" = "x86_64" ]; then
     echo "Installing Kubernetes for x86_64 from official repos..."
@@ -299,7 +362,7 @@ echo ""
 
 # --- CREATE KUBELET SERVICE (for RISC-V) ---
 if [ "$ARCH" = "riscv64" ]; then
-    echo "Step 4: Setting up kubelet service for RISC-V..."
+    echo "Step 8: Setting up kubelet service for RISC-V..."
     
     sudo tee /etc/systemd/system/kubelet.service > /dev/null <<EOF
 [Unit]
@@ -337,7 +400,7 @@ EOF
 fi
 
 # --- JOIN CLUSTER ---
-echo "Step 5: Joining the cluster..."
+echo "Step $( [ "$ARCH" = "riscv64" ] && echo "9" || echo "8" ): Joining the cluster..."
 echo "Running: sudo $JOIN_COMMAND"
 echo ""
 
@@ -351,11 +414,15 @@ echo ""
 sleep 5
 
 # --- VERIFY ---
-echo "Step 6: Verifying setup..."
+echo "Step $( [ "$ARCH" = "riscv64" ] && echo "10" || echo "9" ): Verifying setup..."
 echo ""
 
 echo "Kubelet status:"
 sudo systemctl status kubelet --no-pager -l | head -20
+echo ""
+
+echo "Swap status:"
+sudo swapon --show || echo "✓ No swap active"
 echo ""
 
 echo "Pause image configuration:"
@@ -394,5 +461,9 @@ echo "   - Restart: sudo systemctl restart containerd && sudo systemctl restart 
 echo ""
 echo "4. Monitor kubelet logs:"
 echo "   sudo journalctl -u kubelet -f"
+echo ""
+echo "5. Verify swap is permanently disabled:"
+echo "   sudo swapon --show"
+echo "   cat /proc/swaps"
 echo ""
 echo "============================================"
