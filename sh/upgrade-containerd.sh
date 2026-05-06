@@ -1,17 +1,24 @@
 #!/bin/bash
 
 # ============================================
-# 升级 containerd 从 1.6.x 到 2.1.6
+# containerd 升级和配置脚本 (RISC-V Fedora)
 # ============================================
 
 set -e
 
 # 配置
-CONTAINERD_VERSION="2.1.6"
-CONTAINERD_DOWNLOAD_URL="https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-riscv64.tar.gz"
-BACKUP_DIR="/var/lib/containerd.bak.$(date +%Y%m%d_%H%M%S)"
+CONTAINERD_VERSION="1.7.23"
+RUNC_VERSION="1.1.14"
+PAUSE_TAG="3.10.1"
+DOCKERHUB_USER="cloudv10x"
 
-# 颜色定义
+# 镜像源（用于下载）
+MIRRORS=(
+    "https://github.com"
+    "https://ghproxy.com/https://github.com"
+    "https://mirror.ghproxy.com/https://github.com"
+)
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -20,276 +27,292 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 BOLD='\033[1m'
 
-if [ "$EUID" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
+print_step() {
+    echo -e "\n${BLUE}${BOLD}=== $1 ===${NC}"
+}
 
-clear
-echo -e "${CYAN}${BOLD}====================================================${NC}"
-echo -e "${CYAN}${BOLD}   Containerd Upgrade to v${CONTAINERD_VERSION} (RISC-V)    ${NC}"
-echo -e "${CYAN}${BOLD}====================================================${NC}"
+print_success() {
+    echo -e "${GREEN}✓${NC} $1"
+}
 
-# 检测架构
-ARCH=$(uname -m)
-if [ "$ARCH" != "riscv64" ]; then
-    echo -e "\n${RED}${BOLD}ERROR: This script is for RISC-V only!${NC}"
-    echo -e "${YELLOW}Detected architecture: ${ARCH}${NC}"
-    exit 1
-fi
+print_error() {
+    echo -e "${RED}✗${NC} $1"
+}
 
-echo -e "\n${CYAN}System Information:${NC}"
-echo -e "  Architecture: ${ARCH}"
-echo -e "  Target Version: ${CONTAINERD_VERSION}"
+print_warning() {
+    echo -e "${YELLOW}⚠${NC} $1"
+}
 
-# 检查当前版本
-if command -v containerd &> /dev/null; then
-    CURRENT_VERSION=$(containerd --version 2>/dev/null | awk '{print $3}')
-    echo -e "  Current Version: ${CURRENT_VERSION}"
-fi
+print_info() {
+    echo -e "${CYAN}ℹ${NC} $1"
+}
+
+# ============================================
+# 下载函数（支持多个镜像源）
+# ============================================
+
+download_file() {
+    local url_path="$1"
+    local output_file="$2"
+    
+    for mirror in "${MIRRORS[@]}"; do
+        local full_url="${mirror}${url_path}"
+        print_info "尝试下载: $full_url"
+        
+        if wget -q --show-progress --timeout=30 "$full_url" -O "$output_file" 2>/dev/null; then
+            print_success "下载成功"
+            return 0
+        fi
+    done
+    
+    print_error "所有镜像源下载失败"
+    return 1
+}
+
+# ============================================
+# Step 1: 检查当前版本
+# ============================================
+
+print_step "1. 检查当前环境"
 
 echo ""
-read -p "$(echo -e ${YELLOW}Press Enter to start upgrade...${NC})"
+echo "当前 containerd 版本:"
+containerd --version 2>/dev/null || echo "  未安装"
+
+echo ""
+echo "当前 runc 版本:"
+runc --version 2>/dev/null | head -1 || echo "  未安装"
+
+echo ""
+echo "当前 CRI 版本:"
+sudo crictl version 2>/dev/null || echo "  crictl 不可用"
 
 # ============================================
-# Step 1: Stop Services
+# Step 2: 停止服务
 # ============================================
 
-echo -e "\n${BLUE}${BOLD}[Step 1] Stopping services...${NC}"
+print_step "2. 停止相关服务"
 
-echo -ne "${YELLOW}Stopping kubelet... ${NC}"
-$SUDO systemctl stop kubelet 2>/dev/null || true
-echo -e "${GREEN}OK${NC}"
+print_info "停止 kubelet..."
+sudo systemctl stop kubelet 2>/dev/null || true
 
-echo -ne "${YELLOW}Stopping containerd... ${NC}"
-$SUDO systemctl stop containerd 2>/dev/null || true
-echo -e "${GREEN}OK${NC}"
+print_info "停止 containerd..."
+sudo systemctl stop containerd 2>/dev/null || true
 
-# 确保所有 containerd 进程已停止
-sleep 2
-if pgrep -x containerd > /dev/null; then
-    echo -e "${YELLOW}⚠ Killing remaining containerd processes...${NC}"
-    $SUDO pkill -9 containerd 2>/dev/null || true
-    sleep 1
-fi
-
-echo -e "${GREEN}✓ Services stopped.${NC}"
-
-# ============================================
-# Step 2: Backup Existing Data
-# ============================================
-
-echo -e "\n${BLUE}${BOLD}[Step 2] Backing up containerd data...${NC}"
-
-if [ -d /var/lib/containerd ]; then
-    echo -ne "${YELLOW}Backing up to ${BACKUP_DIR}... ${NC}"
-    $SUDO mv /var/lib/containerd "$BACKUP_DIR"
-    echo -e "${GREEN}OK${NC}"
-    echo -e "${GREEN}✓ Backup saved to: ${BACKUP_DIR}${NC}"
-else
-    echo -e "${YELLOW}⚠ /var/lib/containerd not found, skipping backup.${NC}"
-fi
-
-# 备份配置文件
-if [ -f /etc/containerd/config.toml ]; then
-    echo -ne "${YELLOW}Backing up config.toml... ${NC}"
-    $SUDO cp /etc/containerd/config.toml /etc/containerd/config.toml.bak.$(date +%Y%m%d_%H%M%S)
-    echo -e "${GREEN}OK${NC}"
-fi
-
-# ============================================
-# Step 3: Download and Install
-# ============================================
-
-echo -e "\n${BLUE}${BOLD}[Step 3] Downloading containerd v${CONTAINERD_VERSION}...${NC}"
-
-cd /tmp
-rm -f containerd-*.tar.gz
-rm -rf containerd-install
-mkdir -p containerd-install
-cd containerd-install
-
-echo -e "${CYAN}Download URL: ${CONTAINERD_DOWNLOAD_URL}${NC}"
-
-if wget --show-progress -q "${CONTAINERD_DOWNLOAD_URL}"; then
-    echo -e "${GREEN}✓ Download successful${NC}"
-else
-    echo -e "\n${YELLOW}⚠ wget failed, trying curl...${NC}"
-    if curl -L -O "${CONTAINERD_DOWNLOAD_URL}"; then
-        echo -e "${GREEN}✓ Download successful${NC}"
-    else
-        echo -e "${RED}${BOLD}✗ Download failed!${NC}"
-        exit 1
-    fi
-fi
-
-echo -e "\n${BLUE}${BOLD}Installing containerd...${NC}"
-
-# 解压并安装
-echo -ne "${YELLOW}Extracting binaries... ${NC}"
-$SUDO tar -xzf containerd-*.tar.gz -C /usr/local
-echo -e "${GREEN}OK${NC}"
-
-# 验证安装
-if [ -f /usr/local/bin/containerd ]; then
-    NEW_VERSION=$(/usr/local/bin/containerd --version 2>/dev/null | awk '{print $3}')
-    echo -e "${GREEN}✓ containerd installed: ${NEW_VERSION}${NC}"
-else
-    echo -e "${RED}✗ Installation failed!${NC}"
-    exit 1
-fi
-
-# 创建符号链接
-echo -ne "${YELLOW}Creating symlinks... ${NC}"
-$SUDO ln -sf /usr/local/bin/containerd /usr/bin/containerd
-$SUDO ln -sf /usr/local/bin/containerd-shim /usr/bin/containerd-shim
-$SUDO ln -sf /usr/local/bin/containerd-shim-runc-v1 /usr/bin/containerd-shim-runc-v1
-$SUDO ln -sf /usr/local/bin/containerd-shim-runc-v2 /usr/bin/containerd-shim-runc-v2
-$SUDO ln -sf /usr/local/bin/ctr /usr/bin/ctr
-echo -e "${GREEN}OK${NC}"
-
-# 清理
-cd /tmp
-rm -rf containerd-install
-
-# ============================================
-# Step 4: Configure containerd
-# ============================================
-
-echo -e "\n${BLUE}${BOLD}[Step 4] Configuring containerd...${NC}"
-
-# 创建配置目录
-$SUDO mkdir -p /etc/containerd
-
-# 生成新的默认配置
-echo -ne "${YELLOW}Generating new config.toml... ${NC}"
-$SUDO /usr/local/bin/containerd config default | $SUDO tee /etc/containerd/config.toml > /dev/null
-echo -e "${GREEN}OK${NC}"
-
-# 启用 systemd cgroup 驱动
-echo -ne "${YELLOW}Enabling systemd cgroup driver... ${NC}"
-$SUDO sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-echo -e "${GREEN}OK${NC}"
-
-# 配置 pause 镜像
-echo -ne "${YELLOW}Configuring pause image... ${NC}"
-$SUDO sed -i 's|sandbox_image = .*|sandbox_image = "registry.k8s.io/pause:3.10.1"|' /etc/containerd/config.toml
-echo -e "${GREEN}OK${NC}"
-
-# ============================================
-# Step 5: Setup systemd service
-# ============================================
-
-echo -e "\n${BLUE}${BOLD}[Step 5] Setting up systemd service...${NC}"
-
-# 创建 systemd 服务文件
-$SUDO tee /etc/systemd/system/containerd.service > /dev/null <<EOF
-[Unit]
-Description=containerd container runtime
-Documentation=https://containerd.io
-After=network.target local-fs.target
-
-[Service]
-ExecStartPre=-/sbin/modprobe overlay
-ExecStart=/usr/local/bin/containerd
-Type=notify
-Delegate=yes
-KillMode=process
-Restart=always
-RestartSec=5
-LimitNPROC=infinity
-LimitCORE=infinity
-LimitNOFILE=infinity
-TasksMax=infinity
-OOMScoreAdjust=-999
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-$SUDO systemctl daemon-reload
-echo -e "${GREEN}✓ Service file created${NC}"
-
-# ============================================
-# Step 6: Start and Verify
-# ============================================
-
-echo -e "\n${BLUE}${BOLD}[Step 6] Starting containerd...${NC}"
-
-echo -ne "${YELLOW}Starting containerd... ${NC}"
-$SUDO systemctl start containerd
 sleep 3
+print_success "服务已停止"
 
-if systemctl is-active --quiet containerd; then
-    echo -e "${GREEN}OK${NC}"
+# ============================================
+# Step 3: 下载 containerd
+# ============================================
+
+print_step "3. 下载 containerd ${CONTAINERD_VERSION}"
+
+cd /tmp
+
+CONTAINERD_FILE="containerd-${CONTAINERD_VERSION}-linux-riscv64.tar.gz"
+CONTAINERD_URL="/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-riscv64.tar.gz"
+
+if [ -f "$CONTAINERD_FILE" ]; then
+    print_success "containerd 已下载: $CONTAINERD_FILE"
 else
-    echo -e "${RED}Failed${NC}"
-    echo -e "\n${YELLOW}Checking service status:${NC}"
-    $SUDO systemctl status containerd --no-pager -l
-    exit 1
+    if ! download_file "$CONTAINERD_URL" "$CONTAINERD_FILE"; then
+        print_error "containerd 下载失败"
+        exit 1
+    fi
 fi
 
-echo -ne "${YELLOW}Enabling containerd on boot... ${NC}"
-$SUDO systemctl enable containerd >/dev/null 2>&1 || true
-echo -e "${GREEN}OK${NC}"
+# ============================================
+# Step 4: 下载 runc
+# ============================================
 
-# 等待 containerd 完全就绪
-echo -ne "${YELLOW}Waiting for containerd socket... ${NC}"
-for i in {1..10}; do
-    if $SUDO crictl version >/dev/null 2>&1; then
-        echo -e "${GREEN}Ready!${NC}"
-        break
-    fi
-    sleep 2
-    if [ $i -eq 10 ]; then
-        echo -e "${RED}Timeout${NC}"
-        echo -e "${YELLOW}Check containerd status: sudo systemctl status containerd${NC}"
+print_step "4. 下载 runc ${RUNC_VERSION}"
+
+RUNC_FILE="runc.riscv64"
+RUNC_URL="/opencontainers/runc/releases/download/v${RUNC_VERSION}/runc.riscv64"
+
+if [ -f "$RUNC_FILE" ]; then
+    print_success "runc 已下载: $RUNC_FILE"
+else
+    if ! download_file "$RUNC_URL" "$RUNC_FILE"; then
+        print_error "runc 下载失败"
         exit 1
+    fi
+fi
+
+# ============================================
+# Step 5: 安装 containerd
+# ============================================
+
+print_step "5. 安装 containerd"
+
+print_info "解压 containerd..."
+sudo tar -xzf "$CONTAINERD_FILE" -C /usr/local
+
+print_info "复制文件到 /usr/bin..."
+for file in containerd containerd-shim containerd-shim-runc-v1 containerd-shim-runc-v2 containerd-stress ctr; do
+    if [ -f "/usr/local/bin/$file" ]; then
+        sudo install -m 755 "/usr/local/bin/$file" /usr/bin/
+        print_success "已安装: $file"
     fi
 done
 
 # ============================================
-# Step 7: Verify installation
+# Step 6: 安装 runc
 # ============================================
 
-echo -e "\n${BLUE}${BOLD}[Step 7] Verifying installation...${NC}"
+print_step "6. 安装 runc"
 
-echo -e "\n${CYAN}Containerd version:${NC}"
+sudo install -m 755 "$RUNC_FILE" /usr/local/sbin/runc
+sudo cp -f /usr/local/sbin/runc /usr/sbin/runc 2>/dev/null || true
+
+print_success "runc 已安装"
+
+# ============================================
+# Step 7: 验证新版本
+# ============================================
+
+print_step "7. 验证安装"
+
+echo ""
+containerd --version
+echo ""
+runc --version | head -1
+
+# ============================================
+# Step 8: 配置 containerd
+# ============================================
+
+print_step "8. 配置 containerd"
+
+print_info "生成默认配置..."
+sudo mkdir -p /etc/containerd
+sudo containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
+
+print_info "启用 systemd cgroup..."
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+print_success "SystemdCgroup = true"
+
+print_info "配置 sandbox (pause) 镜像..."
+sudo sed -i "s|sandbox_image = \"registry.k8s.io/pause:3.8\"|sandbox_image = \"registry.k8s.io/pause:${PAUSE_TAG}\"|g" /etc/containerd/config.toml
+print_success "sandbox_image = registry.k8s.io/pause:${PAUSE_TAG}"
+
+print_info "配置 CNI 插件路径..."
+sudo sed -i 's|bin_dir = .*|bin_dir = "/opt/cni/bin"|g' /etc/containerd/config.toml
+print_success "CNI bin_dir = /opt/cni/bin"
+
+print_info "配置 conf_dir（如果存在）..."
+sudo sed -i 's|conf_dir = .*|conf_dir = "/etc/cni/net.d"|g' /etc/containerd/config.toml 2>/dev/null || true
+
+# ============================================
+# Step 9: 配置 pause 镜像
+# ============================================
+
+print_step "9. 配置 pause 镜像标签"
+
+print_info "检查本地 pause 镜像..."
+sudo ctr -n k8s.io images list | grep pause || echo "  未找到 pause 镜像"
+
+print_info "为 pause 镜像创建所有需要的标签..."
+
+# 如果本地有 pause 镜像，创建多个标签
+if sudo ctr -n k8s.io images list | grep -q "${DOCKERHUB_USER}/pause"; then
+    SOURCE_IMAGE="docker.io/${DOCKERHUB_USER}/pause:3.10"
+    
+    # 需要的标签列表
+    TAGS=(
+        "registry.k8s.io/pause:3.6"
+        "registry.k8s.io/pause:3.8"
+        "registry.k8s.io/pause:3.9"
+        "registry.k8s.io/pause:3.10"
+        "registry.k8s.io/pause:${PAUSE_TAG}"
+    )
+    
+    for tag in "${TAGS[@]}"; do
+        if ! sudo ctr -n k8s.io images check "name==${tag}" > /dev/null 2>&1; then
+            sudo ctr -n k8s.io images tag "$SOURCE_IMAGE" "$tag" 2>/dev/null && \
+                print_success "已创建: $tag" || \
+                print_warning "创建失败: $tag"
+        else
+            print_success "已存在: $tag"
+        fi
+    done
+else
+    print_warning "未找到 cloudv10x/pause:3.10 镜像，跳过标签创建"
+    print_info "启动 containerd 后需要手动拉取 pause 镜像"
+fi
+
+# ============================================
+# Step 10: 启动服务
+# ============================================
+
+print_step "10. 启动 containerd"
+
+sudo systemctl daemon-reload
+sudo systemctl start containerd
+sleep 3
+
+if systemctl is-active --quiet containerd; then
+    print_success "containerd 已启动"
+else
+    print_error "containerd 启动失败"
+    sudo systemctl status containerd --no-pager -l
+    exit 1
+fi
+
+# ============================================
+# Step 11: 验证配置
+# ============================================
+
+print_step "11. 验证配置"
+
+echo ""
+echo "=== containerd 版本 ==="
 containerd --version
 
-echo -e "\n${CYAN}Service status:${NC}"
-$SUDO systemctl status containerd --no-pager -l | head -5
+echo ""
+echo "=== runc 版本 ==="
+runc --version | head -1
 
-echo -e "\n${CYAN}CRI status:${NC}"
-$SUDO crictl version
+echo ""
+echo "=== CRI 版本 ==="
+sudo crictl version
+
+echo ""
+echo "=== sandbox 镜像配置 ==="
+sudo grep sandbox_image /etc/containerd/config.toml
+
+echo ""
+echo "=== pause 镜像列表 ==="
+sudo crictl images | grep pause || echo "  未找到（需要拉取）"
+
+echo ""
+echo "=== containerd 状态 ==="
+sudo systemctl status containerd --no-pager -l | head -10
 
 # ============================================
-# Summary
+# Step 12: 设置开机自启
 # ============================================
 
-echo -e "\n${CYAN}${BOLD}====================================================${NC}"
-echo -e "${GREEN}${BOLD}✓ Containerd upgrade complete!${NC}"
-echo -e "${CYAN}${BOLD}====================================================${NC}\n"
+print_step "12. 设置开机自启"
 
-echo -e "${BOLD}Version Information:${NC}"
-echo -e "  Old version: ${CURRENT_VERSION:-unknown}"
-echo -e "  New version: ${CONTAINERD_VERSION}"
+sudo systemctl enable containerd 2>/dev/null || true
+print_success "containerd 已设置为开机自启"
+
+# ============================================
+# 完成
+# ============================================
+
 echo ""
-
-echo -e "${YELLOW}${BOLD}Important Notes:${NC}"
-echo -e "  1. Old data backed up to: ${BACKUP_DIR}"
-echo -e "  2. You may need to re-pull Kubernetes images"
-echo -e "  3. Run: ${CYAN}./pull-images.sh${NC} to re-pull images"
+echo -e "${GREEN}${BOLD}========================================${NC}"
+echo -e "${GREEN}${BOLD}  containerd 升级和配置完成！${NC}"
+echo -e "${GREEN}${BOLD}========================================${NC}"
 echo ""
-
-echo -e "${BOLD}Next Steps:${NC}"
-echo -e "  1. Re-pull images: ${CYAN}./pull-images.sh${NC}"
-echo -e "  2. Run control plane setup: ${CYAN}./setup-control-plane.sh${NC}"
+echo -e "${BOLD}版本信息:${NC}"
+echo -e "  containerd: ${GREEN}$(containerd --version | awk '{print $3}')${NC}"
+echo -e "  runc:       ${GREEN}$(runc --version | head -1 | awk '{print $3}')${NC}"
+echo -e "  pause:      ${GREEN}registry.k8s.io/pause:${PAUSE_TAG}${NC}"
 echo ""
-
-echo -e "${YELLOW}To restore old version if needed:${NC}"
-echo -e "  sudo systemctl stop containerd"
-echo -e "  sudo rm -rf /var/lib/containerd"
-echo -e "  sudo mv ${BACKUP_DIR} /var/lib/containerd"
-echo -e "  # Reinstall old containerd version"
-echo -e "  sudo systemctl start containerd"
+echo -e "${BOLD}下一步:${NC}"
+echo "  运行 kubernetes 主控平面安装脚本"
 echo ""
-
-echo -e "${DIM}${GRAY}Upgrade completed at $(date)${NC}\n"
