@@ -1,12 +1,11 @@
 #!/bin/bash
 
 # ============================================
-# Worker Node Setup (x86 or RISC-V)
+# Worker Node Setup for Fedora (x86 or RISC-V)
 # ============================================
 
 # Configuration - MUST MATCH CONTROL PLANE!
-DOCKERHUB_USER="cloudv10x"  # Your DockerHub username
-PAUSE_VERSION="3.10"
+PAUSE_VERSION="3.10.1"
 K8S_VERSION="v1.35.0"  # Version of your custom RISC-V binaries
 K8S_TARBALL_URL="https://github.com/alitariq4589/kubernetes-riscv/releases/download/${K8S_VERSION}/kubernetes-${K8S_VERSION}-riscv64-linux.tar.gz"
 
@@ -29,11 +28,8 @@ fi
 set -e  # Exit on any error
 
 echo "============================================"
-echo "Kubernetes Worker Node Setup"
+echo "Kubernetes Worker Node Setup (Fedora)"
 echo "============================================"
-echo ""
-echo "Using custom pause image:"
-echo "  ${DOCKERHUB_USER}/pause:${PAUSE_VERSION}"
 echo ""
 
 # Detect architecture
@@ -68,8 +64,8 @@ sudo rm -f /etc/systemd/system/flanneld.service
 sudo rm -f /run/flannel/subnet.env
 sudo systemctl daemon-reload
 
-# Flush iptables
-sudo iptables -F && sudo iptables -t nat -F && sudo iptables -t mangle -F && sudo iptables -X
+# Flush iptables (use nftables for Fedora)
+sudo iptables -F && sudo iptables -t nat -F && sudo iptables -t mangle -F && sudo iptables -X 2>/dev/null || true
 
 # Remove CNI binaries from previous installs
 sudo rm -f /opt/cni/bin/*flannel* 2>/dev/null || true
@@ -81,9 +77,13 @@ echo ""
 # --- INSTALL DEPENDENCIES ---
 echo "Step 2: Installing dependencies..."
 
-sudo apt-get update
-sudo apt-get upgrade -y
-sudo apt-get install -y containerd conntrack ethtool socat ebtables apt-transport-https ca-certificates curl gpg
+# Fedora uses dnf instead of apt
+sudo dnf update -y
+sudo dnf install -y containerd conntrack ethtool socat ebtables ca-certificates curl
+
+# Enable and start containerd
+sudo systemctl enable containerd
+sudo systemctl start containerd
 
 # Configure containerd
 sudo mkdir -p /etc/containerd
@@ -92,13 +92,13 @@ containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
 # Enable systemd cgroup driver
 sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 
-# *** CRITICAL: Configure custom pause image ***
-echo "Configuring custom pause image..."
+# Configure default pause image (registry.k8s.io/pause:3.10.1)
+echo "Configuring default pause image: registry.k8s.io/pause:${PAUSE_VERSION}"
 
 # Detect containerd version
-CONTAINERD_VERSION=$(containerd --version | awk '{print $3}')
-CONTAINERD_MAJOR=${CONTAINERD_VERSION%%.*}
-CONTAINERD_MINOR=${CONTAINERD_VERSION#*.}
+CONTAINERD_VERSION=$(containerd --version | awk '{print $3}' | tr -d 'v')
+CONTAINERD_MAJOR=$(echo $CONTAINERD_VERSION | cut -d. -f1)
+CONTAINERD_MINOR=$(echo $CONTAINERD_VERSION | cut -d. -f2)
 
 echo "Detected containerd version: ${CONTAINERD_MAJOR}.${CONTAINERD_MINOR}"
 
@@ -109,10 +109,10 @@ if [ "$CONTAINERD_MAJOR" -ge 2 ]; then
     # For containerd v2.x, use pinned_images.sandbox
     if grep -q "pinned_images" /etc/containerd/config.toml; then
         echo "Found pinned_images section, updating..."
-        sudo sed -i "s|sandbox = '.*'|sandbox = '${DOCKERHUB_USER}/pause:${PAUSE_VERSION}'|g" /etc/containerd/config.toml
+        sudo sed -i "s|sandbox = '.*'|sandbox = 'registry.k8s.io/pause:${PAUSE_VERSION}'|g" /etc/containerd/config.toml
         
         # Verify it worked
-        if grep -q "sandbox = '${DOCKERHUB_USER}/pause:${PAUSE_VERSION}'" /etc/containerd/config.toml; then
+        if grep -q "sandbox = 'registry.k8s.io/pause:${PAUSE_VERSION}'" /etc/containerd/config.toml; then
             echo "✓ Successfully configured pinned_images.sandbox"
         else
             echo "ERROR: Failed to update pinned_images.sandbox"
@@ -122,7 +122,7 @@ if [ "$CONTAINERD_MAJOR" -ge 2 ]; then
             echo "Please update the configuration manually:"
             echo "  sudo nano /etc/containerd/config.toml"
             echo "  Find: sandbox = 'registry.k8s.io/pause:3.10'"
-            echo "  Replace with: sandbox = '${DOCKERHUB_USER}/pause:${PAUSE_VERSION}'"
+            echo "  Replace with: sandbox = 'registry.k8s.io/pause:${PAUSE_VERSION}'"
             exit 1
         fi
     else
@@ -138,10 +138,10 @@ elif [ "$CONTAINERD_MAJOR" -eq 1 ]; then
     # For containerd v1.x, use sandbox_image
     if grep -q "sandbox_image" /etc/containerd/config.toml; then
         echo "Found sandbox_image, updating..."
-        sudo sed -i "s|sandbox_image = \".*\"|sandbox_image = \"${DOCKERHUB_USER}/pause:${PAUSE_VERSION}\"|g" /etc/containerd/config.toml
+        sudo sed -i "s|sandbox_image = \".*\"|sandbox_image = \"registry.k8s.io/pause:${PAUSE_VERSION}\"|g" /etc/containerd/config.toml
         
         # Verify it worked
-        if grep -q "sandbox_image = \"${DOCKERHUB_USER}/pause:${PAUSE_VERSION}\"" /etc/containerd/config.toml; then
+        if grep -q "sandbox_image = \"registry.k8s.io/pause:${PAUSE_VERSION}\"" /etc/containerd/config.toml; then
             echo "✓ Successfully configured sandbox_image"
         else
             echo "ERROR: Failed to update sandbox_image"
@@ -151,7 +151,7 @@ elif [ "$CONTAINERD_MAJOR" -eq 1 ]; then
             echo "Please update the configuration manually:"
             echo "  sudo nano /etc/containerd/config.toml"
             echo "  Find: sandbox_image = \"registry.k8s.io/pause:3.10\""
-            echo "  Replace with: sandbox_image = \"${DOCKERHUB_USER}/pause:${PAUSE_VERSION}\""
+            echo "  Replace with: sandbox_image = \"registry.k8s.io/pause:${PAUSE_VERSION}\""
             exit 1
         fi
     else
@@ -178,15 +178,20 @@ else
 fi
 echo ""
 
+# Restart containerd to apply changes
 sudo systemctl restart containerd
-sudo systemctl enable containerd
 
-echo "✓ Containerd configured with custom pause image"
+echo "✓ Containerd configured with default pause image (registry.k8s.io/pause:${PAUSE_VERSION})"
 echo ""
 
 # Disable swap
 sudo swapoff -a
-sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+# Fedora uses different swap configuration
+sudo sed -i '/ swap / s/^/#/' /etc/fstab
+# Also disable zram if present (common in Fedora)
+sudo systemctl stop systemd-zram-setup@zram0.service 2>/dev/null || true
+sudo systemctl disable systemd-zram-setup@zram0.service 2>/dev/null || true
+sudo swapoff /dev/zram0 2>/dev/null || true
 
 # Load kernel modules
 cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
@@ -206,6 +211,16 @@ EOF
 
 sudo sysctl --system
 
+# Configure firewall if firewalld is active
+if systemctl is-active --quiet firewalld; then
+    echo "Configuring firewalld for Kubernetes..."
+    sudo firewall-cmd --permanent --add-port=10250/tcp  # Kubelet API
+    sudo firewall-cmd --permanent --add-port=30000-32767/tcp  # NodePort services
+    sudo firewall-cmd --permanent --add-port=8472/udp  # Flannel VXLAN (if using Flannel)
+    sudo firewall-cmd --permanent --add-port=8285/udp  # Flannel UDP (if using Flannel)
+    sudo firewall-cmd --reload
+fi
+
 echo "✓ System configured"
 echo ""
 
@@ -215,13 +230,18 @@ echo "Step 3: Installing Kubernetes..."
 if [ "$ARCH" = "x86_64" ]; then
     echo "Installing Kubernetes for x86_64 from official repos..."
     
-    sudo mkdir -p /etc/apt/keyrings
-    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-    echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
-    
-    sudo apt-get update
-    sudo apt-get install -y kubelet kubeadm kubectl
-    sudo apt-mark hold kubelet kubeadm kubectl
+    # Fedora uses different repo configuration
+    cat <<EOF | sudo tee /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://pkgs.k8s.io/core:/stable:/v1.31/rpm/
+enabled=1
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/core:/stable:/v1.31/rpm/repodata/repomd.xml.key
+EOF
+
+    sudo dnf install -y kubelet kubeadm kubectl
+    sudo dnf versionlock add kubelet kubeadm kubectl || true
     
 elif [ "$ARCH" = "riscv64" ]; then
     echo "Installing Kubernetes for RISC-V from custom binaries..."
@@ -365,10 +385,10 @@ echo ""
 echo "3. If you see pause container errors:"
 if [ "$CONTAINERD_MAJOR" -ge 2 ]; then
     echo "   - Verify: sudo grep -A2 'pinned_images' /etc/containerd/config.toml"
-    echo "   - Should show: sandbox = '${DOCKERHUB_USER}/pause:${PAUSE_VERSION}'"
+    echo "   - Should show: sandbox = 'registry.k8s.io/pause:${PAUSE_VERSION}'"
 else
     echo "   - Verify: sudo grep sandbox_image /etc/containerd/config.toml"
-    echo "   - Should show: sandbox_image = \"${DOCKERHUB_USER}/pause:${PAUSE_VERSION}\""
+    echo "   - Should show: sandbox_image = \"registry.k8s.io/pause:${PAUSE_VERSION}\""
 fi
 echo "   - Restart: sudo systemctl restart containerd && sudo systemctl restart kubelet"
 echo ""
